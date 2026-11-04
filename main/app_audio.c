@@ -1,0 +1,659 @@
+/**
+ ******************************************************************************
+ * @file        app_audio.c
+ * @brief       WAV / MP3 播放层
+ *
+ * 数据流:
+ *   audio_source_task (prio 4, core 1, 20KB 栈)     audio_player_task (prio 6, core 0)
+ *     解析头部 / MP3 探测+解码            -->  PSRAM 环形缓冲  -->  I2S DMA
+ *
+ * 为什么这么分工:
+ *   1) I2S DMA 只缓冲 ~93ms, 若边 fread/边解码/边写 I2S, 任何一次卡顿都会欠载 -> 断续;
+ *   2) MP3 解码是纯 CPU 活, 放低优先级任务并钉到 core 1, 不与 core 0 上的视频解码抢 CPU;
+ *   3) minimp3 的 mp3dec_decode_frame 会在栈上放一个 mp3dec_scratch_t(约 13KB), 所以
+ *      "探测首帧"和"解码"都必须在这个大栈任务里做, 绝不能放在播放任务里(否则栈溢出);
+ *   4) 环形缓冲里统一放"立体声 16bit PCM", 播放任务只做搬运, 逻辑最简单。
+ ******************************************************************************
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <inttypes.h>
+
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/ringbuf.h"
+
+#include "minimp3.h"
+
+#include "app_audio.h"
+#include "app_es8311.h"
+
+static const char *TAG = "app_audio";
+
+/* ============================================================================
+ * 参数
+ * ========================================================================== */
+#define AUDIO_RINGBUF_SIZE      (256 * 1024)   /* 44.1k/16bit/立体声 约 1.5 秒 */
+#define AUDIO_READ_CHUNK        (8 * 1024)     /* 每次从文件读 8KB */
+#define AUDIO_RECV_CHUNK        (4 * 1024)     /* 播放任务每次从环形缓冲取 4KB */
+#define AUDIO_PREFILL_BYTES     (96 * 1024)    /* 起播前先垫 96KB, 防止开头就欠载 */
+
+#define AUDIO_PLAYER_STACK      6144
+#define AUDIO_PLAYER_PRIO       6              /* 高于视频读盘(5), 保证喂 DMA 不被抢 */
+#define AUDIO_PLAYER_CORE       0              /* 跟视频解码同一个核 */
+
+/* MP3 解码需要 ~17KB 栈: minimp3 的 mp3dec_decode_frame 在栈上放了一个
+ * mp3dec_scratch_t (maindata 2815 + grbuf 4608 + syn 8448 + ... ≈ 16.3KB),
+ * 所以解析/探测/解码都必须在下面这个大栈任务里做, 给到 24KB 留余量 */
+#define AUDIO_SOURCE_STACK      24576
+#define AUDIO_SOURCE_PRIO       4              /* 低于视频读盘, SD 让路给视频 */
+#define AUDIO_SOURCE_CORE       1              /* 钉在 core 1, 不与视频解码争 CPU */
+
+#define MP3_IN_BUF              (16 * 1024)    /* MP3 码流缓冲 / WAV 读缓冲 */
+#define MP3_PROBE_BYTES         (8 * 1024)     /* 探测首个有效帧的范围 */
+
+/* ============================================================================
+ * 音频源信息
+ * ========================================================================== */
+typedef enum {
+    AUDIO_FMT_UNKNOWN = 0,
+    AUDIO_FMT_WAV,
+    AUDIO_FMT_MP3,
+} audio_fmt_t;
+
+typedef struct {
+    uint16_t channels;          /* 1 或 2 */
+    uint16_t bits_per_sample;
+    uint32_t sample_rate;
+    uint32_t data_offset;       /* PCM 数据 / 第一个 MP3 帧的偏移 */
+    uint32_t data_size;
+} wav_info_t;
+
+typedef struct {
+    audio_fmt_t fmt;
+    uint16_t    channels;       /* 源声道数 */
+    uint32_t    sample_rate;
+    uint32_t    data_offset;
+} audio_info_t;
+
+typedef struct {
+    FILE        *f;
+    audio_fmt_t  fmt;           /* 播放任务判断后填入 */
+    audio_info_t info;          /* 源任务探测后填入 */
+} audio_src_t;
+
+/* ============================================================================
+ * 模块状态
+ * ========================================================================== */
+static RingbufHandle_t  s_ringbuf        = NULL;
+static char             s_media_path[128];
+static audio_src_t      s_src;
+
+static volatile bool     s_stop              = false;
+static volatile bool     s_eof               = false;
+static volatile bool     s_info_ready        = false;
+static volatile bool     s_source_error      = false;
+static volatile bool     s_source_running    = false;
+static volatile bool     s_player_running    = false;
+static volatile uint32_t s_underruns         = 0;
+static volatile int64_t  s_clock_start_us    = 0;
+static volatile bool     s_paused            = false;
+static volatile int64_t  s_pause_ts_us       = 0;
+
+/* ============================================================================
+ * 小工具
+ * ========================================================================== */
+static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+
+static uint32_t le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* 把 PCM 数据推进环形缓冲 (s_stop 时立即放弃) */
+static void ring_push(const uint8_t *data, size_t len)
+{
+    size_t off = 0;
+    while (off < len && !s_stop) {
+        if (xRingbufferSend(s_ringbuf, data + off, len - off, pdMS_TO_TICKS(100)) == pdTRUE) {
+            off = len;
+        }
+    }
+}
+
+/* ============================================================================
+ * WAV 解析
+ *   注意: 不能用"固定跳过 44 字节"的写法 — WAV 里经常还有 LIST/fact 等 chunk,
+ *         固定偏移会让 PCM 起点错位(只有噪音或干脆听不出内容)
+ * ========================================================================== */
+static bool wav_read_info(FILE *f, wav_info_t *info)
+{
+    uint8_t hdr[12];
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) return false;
+    if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) return false;
+
+    bool got_fmt = false;
+    for (int guard = 0; guard < 64; guard++) {
+        uint8_t ch[8];
+        if (fread(ch, 1, sizeof(ch), f) != sizeof(ch)) return false;
+
+        uint32_t size = le32(ch + 4);
+        long pad = (long)(size & 1);   /* chunk 按偶数字节对齐 */
+
+        if (memcmp(ch, "fmt ", 4) == 0) {
+            uint8_t fmt[16] = {0};
+            uint32_t n = size < sizeof(fmt) ? size : sizeof(fmt);
+            if (fread(fmt, 1, n, f) != n) return false;
+            if (le16(fmt) != 1) {   /* 1 = PCM */
+                ESP_LOGE(TAG, "WAV 不是 PCM 格式 (audio_format=%u)", le16(fmt));
+                return false;
+            }
+            info->channels        = le16(fmt + 2);
+            info->sample_rate     = le32(fmt + 4);
+            info->bits_per_sample = le16(fmt + 14);
+            got_fmt = true;
+            fseek(f, (long)size - (long)n + pad, SEEK_CUR);
+        } else if (memcmp(ch, "data", 4) == 0) {
+            info->data_offset = (uint32_t)ftell(f);
+            info->data_size   = size;
+            return got_fmt;
+        } else {
+            fseek(f, (long)size + pad, SEEK_CUR);
+        }
+    }
+    return false;
+}
+
+/* ============================================================================
+ * 格式探测 + MP3 首帧探测(拿到采样率/声道数)
+ * ========================================================================== */
+static audio_fmt_t detect_format(FILE *f)
+{
+    uint8_t hdr[12];
+    fseek(f, 0, SEEK_SET);
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        fseek(f, 0, SEEK_SET);
+        return AUDIO_FMT_UNKNOWN;
+    }
+    fseek(f, 0, SEEK_SET);
+
+    if (memcmp(hdr, "RIFF", 4) == 0 && memcmp(hdr + 8, "WAVE", 4) == 0) {
+        return AUDIO_FMT_WAV;
+    }
+    if (memcmp(hdr, "ID3", 3) == 0) {
+        return AUDIO_FMT_MP3;
+    }
+    if (hdr[0] == 0xFF && (hdr[1] & 0xE0) == 0xE0) {   /* MPEG 帧同步字 */
+        return AUDIO_FMT_MP3;
+    }
+    return AUDIO_FMT_UNKNOWN;
+}
+
+/* 跳过 ID3v2 标签, 返回音频数据起始偏移 */
+static long mp3_skip_id3(FILE *f)
+{
+    uint8_t hdr[10];
+    fseek(f, 0, SEEK_SET);
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        return 0;
+    }
+    if (memcmp(hdr, "ID3", 3) != 0) {
+        return 0;
+    }
+    /* ID3v2 大小是 4 个 7bit 字节(syncsafe) */
+    long size = ((long)(hdr[6] & 0x7F) << 21) | ((long)(hdr[7] & 0x7F) << 14) |
+                ((long)(hdr[8] & 0x7F) << 7) | (long)(hdr[9] & 0x7F);
+    long total = 10 + size + ((hdr[5] & 0x10) ? 10 : 0);   /* 有 footer 再加 10 */
+    return total;
+}
+
+/* 在前若干 KB 里找到第一个能解出来的 MP3 帧, 顺便拿到采样率/声道数
+ * 注意: 内部会调用 mp3dec_decode_frame, 必须在 20KB 栈的源任务里运行 */
+static bool mp3_probe(FILE *f, audio_info_t *info)
+{
+    bool ok = false;
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(MP3_PROBE_BYTES, MALLOC_CAP_SPIRAM);
+    int16_t *pcm = (int16_t *)heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t),
+                                               MALLOC_CAP_DEFAULT);
+    mp3dec_t *dec = (mp3dec_t *)heap_caps_calloc(1, sizeof(mp3dec_t), MALLOC_CAP_DEFAULT);
+    if (!buf || !pcm || !dec) {
+        ESP_LOGE(TAG, "MP3 探测: 内存不足");
+        goto out;
+    }
+
+    long base = mp3_skip_id3(f);
+    fseek(f, base, SEEK_SET);
+    size_t n = fread(buf, 1, MP3_PROBE_BYTES, f);
+
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if (buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0) {
+            continue;
+        }
+        mp3dec_frame_info_t fi;
+        mp3dec_init(dec);
+        int samples = mp3dec_decode_frame(dec, buf + i, (int)(n - i), pcm, &fi);
+        if (samples > 0 && fi.hz > 0 && (fi.channels == 1 || fi.channels == 2)) {
+            info->sample_rate = (uint32_t)fi.hz;
+            info->channels    = (uint16_t)fi.channels;
+            info->data_offset = (uint32_t)(base + (long)i);
+            ESP_LOGI(TAG, "MP3 首帧: %d Hz / %d ch / %d kbps (标签结束于 %ld)",
+                     fi.hz, fi.channels, fi.bitrate_kbps, base);
+            ok = true;
+            break;
+        }
+    }
+
+out:
+    free(buf);
+    free(pcm);
+    free(dec);
+    return ok;
+}
+
+/* ============================================================================
+ * 音频源任务: 读文件 -> (解码) -> 立体声 16bit PCM -> 环形缓冲
+ * ========================================================================== */
+/* 单声道 -> 左右复制; 双声道原样 */
+static size_t to_stereo(const uint8_t *src, size_t bytes, uint16_t channels, uint8_t *dst)
+{
+    if (channels == 1) {
+        size_t samples = bytes / 2;
+        for (size_t i = 0; i < samples; i++) {
+            dst[4 * i + 0] = src[2 * i + 0];
+            dst[4 * i + 1] = src[2 * i + 1];
+            dst[4 * i + 2] = src[2 * i + 0];
+            dst[4 * i + 3] = src[2 * i + 1];
+        }
+        return samples * 4;
+    }
+    memcpy(dst, src, bytes);
+    return bytes;
+}
+
+static void pump_wav(audio_src_t *src, uint8_t *pcm_out, uint8_t *read_buf)
+{
+    const size_t chunk = (src->info.channels == 1) ? AUDIO_READ_CHUNK / 2 : AUDIO_READ_CHUNK;
+
+    while (!s_stop) {
+        size_t n = fread(read_buf, 1, chunk, src->f);
+        n &= ~(size_t)1;                     /* 16bit 对齐 */
+        if (n == 0) {
+            break;
+        }
+        size_t out = to_stereo(read_buf, n, src->info.channels, pcm_out);
+        ring_push(pcm_out, out);
+    }
+}
+
+static void pump_mp3(audio_src_t *src, uint8_t *pcm_out, uint8_t *read_buf)
+{
+    mp3dec_t *dec = (mp3dec_t *)heap_caps_calloc(1, sizeof(mp3dec_t), MALLOC_CAP_DEFAULT);
+    int16_t *pcm = (int16_t *)heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t),
+                                               MALLOC_CAP_DEFAULT);
+    if (!dec || !pcm) {
+        ESP_LOGE(TAG, "MP3 解码: 内存不足");
+        free(dec);
+        free(pcm);
+        return;
+    }
+
+    mp3dec_init(dec);
+    size_t have = 0;
+    bool eof = false;
+
+    while (!s_stop) {
+        if (!eof && have < MP3_IN_BUF) {
+            size_t n = fread(read_buf + have, 1, MP3_IN_BUF - have, src->f);
+            if (n == 0) {
+                eof = true;
+            } else {
+                have += n;
+            }
+        }
+
+        mp3dec_frame_info_t fi;
+        int samples = mp3dec_decode_frame(dec, read_buf, (int)have, pcm, &fi);
+
+        if (samples > 0) {
+            /* samples 是"每声道"样点数; 立体声时 pcm 里是交织数据 */
+            size_t bytes = (size_t)samples * (size_t)fi.channels * 2;
+            size_t out = to_stereo((const uint8_t *)pcm, bytes, (uint16_t)fi.channels, pcm_out);
+            ring_push(pcm_out, out);
+
+            if (fi.frame_bytes <= 0) {
+                break;                                               /* 保险: 防止死循环 */
+            }
+            memmove(read_buf, read_buf + fi.frame_bytes, have - fi.frame_bytes);
+            have -= fi.frame_bytes;
+        } else if (fi.frame_bytes > 0) {
+            /* 坏帧/被跳过的数据 */
+            memmove(read_buf, read_buf + fi.frame_bytes, have - fi.frame_bytes);
+            have -= fi.frame_bytes;
+        } else {
+            /* 数据不够一个完整帧 */
+            if (eof) {
+                break;
+            }
+            if (have == MP3_IN_BUF) {
+                /* 缓冲满却解不出, 说明是垃圾数据: 丢掉一半继续找同步字 */
+                ESP_LOGW(TAG, "MP3: 丢弃 %d 字节无法解析的数据", MP3_IN_BUF / 2);
+                memmove(read_buf, read_buf + MP3_IN_BUF / 2, MP3_IN_BUF / 2);
+                have = MP3_IN_BUF / 2;
+            }
+        }
+    }
+
+    free(dec);
+    free(pcm);
+}
+
+static void audio_source_task(void *pvParameters)
+{
+    audio_src_t *src = (audio_src_t *)pvParameters;
+    bool ok = false;
+
+    /* read_buf: 文件原始数据 (MP3 码流缓冲也用这块, 取 MP3_IN_BUF)
+     * pcm_out : 立体声 16bit 输出 (单声道时要 x2 空间) */
+    uint8_t *read_buf = (uint8_t *)heap_caps_malloc(MP3_IN_BUF, MALLOC_CAP_SPIRAM);
+    uint8_t *pcm_out  = (uint8_t *)heap_caps_malloc(MP3_IN_BUF * 2, MALLOC_CAP_SPIRAM);
+
+    if (read_buf && pcm_out) {
+        /* 解析/探测都放在这个大栈任务里做(见文件头说明) */
+        if (src->fmt == AUDIO_FMT_WAV) {
+            wav_info_t wav = {0};
+            if (wav_read_info(src->f, &wav)) {
+                ESP_LOGI(TAG, "WAV: %" PRIu32 " Hz / %u ch / %u bit / %" PRIu32 " bytes",
+                         wav.sample_rate, wav.channels, wav.bits_per_sample, wav.data_size);
+                if (wav.bits_per_sample == 16 && (wav.channels == 1 || wav.channels == 2)) {
+                    src->info.channels    = wav.channels;
+                    src->info.sample_rate = wav.sample_rate;
+                    src->info.data_offset = wav.data_offset;
+                    ok = true;
+                } else {
+                    ESP_LOGE(TAG, "不支持的 WAV: 需要 16bit PCM / 单或双声道 (当前 %u ch / %u bit)",
+                             wav.channels, wav.bits_per_sample);
+                }
+            }
+        } else if (src->fmt == AUDIO_FMT_MP3) {
+            ok = mp3_probe(src->f, &src->info);
+            if (ok) {
+                ESP_LOGI(TAG, "MP3: %" PRIu32 " Hz / %u ch",
+                         src->info.sample_rate, src->info.channels);
+            }
+        }
+    } else {
+        ESP_LOGE(TAG, "音频源: 内存不足");
+    }
+
+    src->info.fmt = src->fmt;
+    __sync_synchronize();
+    s_info_ready = true;                       /* 通知播放任务: 采样率/声道已就绪 */
+
+    if (ok) {
+        ESP_LOGI(TAG, "源任务栈余量: %u 字节", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
+        fseek(src->f, (long)src->info.data_offset, SEEK_SET);
+        if (src->fmt == AUDIO_FMT_MP3) {
+            pump_mp3(src, pcm_out, read_buf);
+        } else {
+            pump_wav(src, pcm_out, read_buf);
+        }
+        ESP_LOGI(TAG, "源任务栈余量(收尾): %u 字节", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    } else {
+        s_source_error = true;
+    }
+
+    free(read_buf);
+    free(pcm_out);
+    s_eof = true;                              /* 数据已全部进缓冲 / 出错结束 */
+    s_source_running = false;
+    ESP_LOGI(TAG, "音频源结束 (数据已全部进入缓冲)");
+    vTaskDelete(NULL);
+}
+
+/* ============================================================================
+ * 播放任务: 环形缓冲 -> I2S (只做搬运, 不做解码)
+ * ========================================================================== */
+static void audio_player_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    char base[sizeof(s_media_path)];
+    strlcpy(base, s_media_path, sizeof(base));
+    char *dot = strrchr(base, '.');
+    if (dot) {
+        *dot = '\0';                           /* 去掉视频扩展名, 换成音频扩展名 */
+    }
+
+    /* 优先 .wav(无损), 没有再找 .mp3 */
+    static const char *const exts[] = {".wav", ".mp3"};
+    char path[sizeof(s_media_path) + 8];
+    FILE *f_audio = NULL;
+    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]) && f_audio == NULL; i++) {
+        snprintf(path, sizeof(path), "%s%s", base, exts[i]);
+        f_audio = fopen(path, "rb");
+    }
+    if (!f_audio) {
+        ESP_LOGW(TAG, "找不到音频文件: %s.wav / %s.mp3 -> 改用系统定时器做音视频时钟(无声)", base, base);
+        goto exit;
+    }
+
+    /* 以文件内容判断格式, 不盲信扩展名 */
+    audio_fmt_t fmt = detect_format(f_audio);
+    if (fmt == AUDIO_FMT_UNKNOWN) {
+        ESP_LOGE(TAG, "无法识别的音频文件: %s (只支持 WAV-PCM / MP3)", path);
+        goto exit;
+    }
+
+    if (!s_ringbuf) {
+        s_ringbuf = xRingbufferCreateWithCaps(AUDIO_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF,
+                                              MALLOC_CAP_SPIRAM);
+    }
+    if (!s_ringbuf) {
+        ESP_LOGE(TAG, "创建音频环形缓冲失败");
+        goto exit;
+    }
+
+    /* 丢弃上一轮可能残留的数据 */
+    void *stale = NULL;
+    size_t stale_size = 0;
+    while ((stale = xRingbufferReceiveUpTo(s_ringbuf, &stale_size, 0, AUDIO_RECV_CHUNK)) != NULL) {
+        vRingbufferReturnItem(s_ringbuf, stale);
+    }
+
+    s_src.f   = f_audio;
+    s_src.fmt = fmt;
+    memset(&s_src.info, 0, sizeof(s_src.info));
+
+    s_eof = false;
+    s_underruns = 0;
+    s_info_ready = false;
+    s_source_error = false;
+    s_source_running = true;
+    xTaskCreatePinnedToCore(audio_source_task, "audio_src", AUDIO_SOURCE_STACK, &s_src,
+                            AUDIO_SOURCE_PRIO, NULL, AUDIO_SOURCE_CORE);
+
+    /* 等源任务把采样率/声道探测出来 (WAV 要读头部, MP3 要解首帧) */
+    int64_t t_wait = esp_timer_get_time();
+    while (!s_info_ready && !s_stop) {
+        if (esp_timer_get_time() - t_wait > 3000000) {
+            ESP_LOGW(TAG, "等待音频源超时");
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    if (!s_info_ready || s_source_error) {
+        ESP_LOGE(TAG, "音频源初始化失败: %s", path);
+        goto exit;
+    }
+
+    /* 采样率要等探测结果出来后再设 (I2S 时钟 + ES8311 在 slave 下无需改寄存器) */
+    app_audio_hw_set_rate(s_src.info.sample_rate);
+
+    /* 预填充: 先把缓冲垫起来再起播, 这样开头不会有空洞
+     * MP3 需要先解码一会儿, 所以时间上限放宽一些 */
+    int64_t t_fill = esp_timer_get_time();
+    while (!s_stop && !s_eof) {
+        size_t buffered = AUDIO_RINGBUF_SIZE - xRingbufferGetCurFreeSize(s_ringbuf);
+        if (buffered >= AUDIO_PREFILL_BYTES) {
+            break;
+        }
+        if (esp_timer_get_time() - t_fill > 2000000) {
+            ESP_LOGW(TAG, "预填充超时, 已垫 %u 字节", (unsigned)buffered);
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    app_audio_hw_pa_enable(true);
+    s_clock_start_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "开始播放音频: %s (%" PRIu32 " Hz / %u ch)",
+             path, s_src.info.sample_rate, s_src.info.channels);
+
+    {
+        static uint8_t pcm_buf[AUDIO_RECV_CHUNK];   /* 内部 RAM, 供 I2S 拷贝 */
+        size_t bytes_written = 0;
+        size_t total_bytes = 0;
+
+        while (!s_stop) {
+            if (s_paused) {
+                vTaskDelay(pdMS_TO_TICKS(20));   /* 暂停: 不写 I2S, 缓冲会自然填满后阻塞源任务 */
+                continue;
+            }
+
+            size_t item_size = 0;
+            uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(s_ringbuf, &item_size,
+                                                              pdMS_TO_TICKS(20), AUDIO_RECV_CHUNK);
+            if (!data) {
+                if (s_eof) {
+                    break;          /* 源已结束 + 缓冲已抽空 -> 放完了 */
+                }
+                s_underruns++;      /* 缓冲被抽空: 解码/读盘供不上了 */
+                continue;
+            }
+
+            item_size &= ~(size_t)1;                    /* 16bit 对齐 */
+            if (item_size > 0) {
+                memcpy(pcm_buf, data, item_size);
+            }
+            vRingbufferReturnItem(s_ringbuf, data);
+
+            if (item_size == 0) {
+                continue;
+            }
+
+            if (i2s_channel_write(app_audio_hw_tx_handle(), pcm_buf, item_size, &bytes_written,
+                                  pdMS_TO_TICKS(1000)) != ESP_OK) {
+                ESP_LOGW(TAG, "i2s_channel_write 失败");
+                break;
+            }
+            total_bytes += bytes_written;
+        }
+
+        ESP_LOGI(TAG, "播放结束: 写入 %u 字节 (~%u 秒), 缓冲欠载 %u 次",
+                 (unsigned)total_bytes,
+                 (unsigned)(total_bytes / (s_src.info.sample_rate * 4)),
+                 (unsigned)s_underruns);
+    }
+
+exit:
+    /* 先让源任务收手再关文件, 否则它可能正在 fread 这个 FILE */
+    s_stop = true;
+    for (int i = 0; i < 100 && s_source_running; i++) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (f_audio) {
+        fclose(f_audio);
+    }
+    if (s_clock_start_us == 0) {
+        /* 音频不可用时也要给个时钟, 让视频改用系统定时器继续播 */
+        s_clock_start_us = esp_timer_get_time();
+    }
+    s_player_running = false;
+    vTaskDelete(NULL);
+}
+
+/* ============================================================================
+ * 对外接口
+ * ========================================================================== */
+esp_err_t app_audio_play(const char *media_path)
+{
+    if (media_path == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 上一轮如果还没退干净, 先停掉并等它退出 (最多等 1s) */
+    app_audio_stop();
+    for (int i = 0; i < 200 && (s_player_running || s_source_running); i++) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    strlcpy(s_media_path, media_path, sizeof(s_media_path));
+
+    s_stop           = false;
+    s_eof            = false;
+    s_info_ready     = false;
+    s_source_error   = false;
+    s_underruns      = 0;
+    s_clock_start_us = 0;
+    s_paused         = false;
+    s_pause_ts_us    = 0;
+    s_player_running = true;
+
+    if (xTaskCreatePinnedToCore(audio_player_task, "audio_player", AUDIO_PLAYER_STACK, NULL,
+                                AUDIO_PLAYER_PRIO, NULL, AUDIO_PLAYER_CORE) != pdPASS) {
+        s_player_running = false;
+        ESP_LOGE(TAG, "创建播放任务失败");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+void app_audio_stop(void)
+{
+    s_stop = true;
+}
+
+void app_audio_set_paused(bool paused)
+{
+    if (paused == s_paused) {
+        return;
+    }
+    if (paused) {
+        s_pause_ts_us = esp_timer_get_time();
+        s_paused = true;
+        ESP_LOGI(TAG, "暂停");
+    } else {
+        /* 把暂停期间的时长补回时钟起点, 保证音视频同步不漂 */
+        if (s_pause_ts_us != 0 && s_clock_start_us != 0) {
+            s_clock_start_us += (esp_timer_get_time() - s_pause_ts_us);
+        }
+        s_pause_ts_us = 0;
+        s_paused = false;
+        ESP_LOGI(TAG, "继续");
+    }
+}
+
+bool app_audio_is_paused(void)
+{
+    return s_paused;
+}
+
+int64_t app_audio_get_clock_us(void)
+{
+    int64_t start = s_clock_start_us;
+    if (start == 0) {
+        return 0;
+    }
+    return esp_timer_get_time() - start;
+}
+
+bool app_audio_is_playing(void)
+{
+    return s_player_running;
+}
