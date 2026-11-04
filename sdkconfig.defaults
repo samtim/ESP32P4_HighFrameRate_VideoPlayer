@@ -3,26 +3,27 @@
 # ==============================================================================
 CONFIG_IDF_TARGET="esp32p4"
 
-# 设置 CPU 主频为 400MHz (保证 MIPI-DSI 的 20MHz 参考 PLL 时钟分频与计算正常)
-CONFIG_ESP32P4_CPU_CLK_400M=y
+# 璁剧疆 CPU 涓婚涓?400MHz (淇濊瘉 MIPI-DSI 鐨?20MHz 鍙傝€?PLL 鏃堕挓鍒嗛涓庤绠楁甯?
+# 娉? IDF 5.x 鐨勬纭鍙锋槸 ESP_DEFAULT_CPU_FREQ_MHZ_400銆?#     鍘熸潵鐨?ESP32P4_CPU_CLK_400M 鏄笉瀛樺湪鐨勭鍙? 鍐欏畠浼氬湪姣忔鏋勫缓鏃舵姤璀﹀憡涓斿畬鍏ㄤ笉鐢熸晥銆?#     (璇ラ€夐」渚濊禆鑺墖 revision >= 3.0, 鏇磋€佺殑 P4 鍙兘璺?360MHz)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y
 
 # ==============================================================================
 # PSRAM (SPIRAM) Configuration
-# 600x1024 帧缓冲区与 MJPEG 解码缓冲区依赖 PSRAM
+# 600x1024 甯х紦鍐插尯涓?MJPEG 瑙ｇ爜缂撳啿鍖轰緷璧?PSRAM
 # ==============================================================================
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_200M=y
 
 # ==============================================================================
 # Cache & Memory Optimization
-# 开启 256KB L2 Cache 和 128B Cache Line，提升 DMA2D 刷屏与解码吞吐率
+# 寮€鍚?256KB L2 Cache 鍜?128B Cache Line锛屾彁鍗?DMA2D 鍒峰睆涓庤В鐮佸悶鍚愮巼
 # ==============================================================================
 CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 
 # ==============================================================================
 # FatFS (SD Card) Configuration
-# 支持 SD 卡长文件名 (如 video_600x1024_demo.mjpeg)
+# 鏀寔 SD 鍗￠暱鏂囦欢鍚?(濡?video_600x1024_demo.mjpeg)
 # ==============================================================================
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
@@ -32,3 +33,6 @@ CONFIG_FATFS_MAX_LFN=255
 # ==============================================================================
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64

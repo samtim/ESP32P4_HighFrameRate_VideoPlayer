@@ -1,5 +1,6 @@
 #include "app_lcd.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_vendor.h"
 #include "driver/gpio.h"
@@ -10,9 +11,9 @@
 
 static const char *TAG = "app_lcd";
 
-#define LCD_BL_PIN       GPIO_NUM_23  // 背光控制脚
-#define LCD_RST_PIN      GPIO_NUM_22  // 复位脚
-#define LCD_PWREN_PIN    GPIO_NUM_21  // 屏幕上电脚
+#define LCD_BL_PIN       GPIO_NUM_23  
+#define LCD_RST_PIN      GPIO_NUM_22  
+#define LCD_PWREN_PIN    GPIO_NUM_21  
 
 #define EK79007_INIT_CMD_LEN  9
 
@@ -22,7 +23,6 @@ typedef struct {
     size_t data_bytes;
 } mipi_lcd_init_cmd_t;
 
-// 慧勤智远官方 EK79007 初始化序列
 static const mipi_lcd_init_cmd_t ek79007_init_cmds[] = {
     {0x80, (uint8_t[]){0x8B}, 1},
     {0x81, (uint8_t[]){0x78}, 1},
@@ -38,8 +38,8 @@ static const mipi_lcd_init_cmd_t ek79007_init_cmds[] = {
 static void lcd_bsp_enable_dsi_phy_power(void) {
     esp_ldo_channel_handle_t ldo_mipi_phy = NULL;
     esp_ldo_channel_config_t ldo_mipi_phy_config = {
-        .chan_id    = 3,     // LDO3
-        .voltage_mv = 2500,  // 2.5V
+        .chan_id    = 3,     
+        .voltage_mv = 2500,  
     };
     ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_mipi_phy_config, &ldo_mipi_phy));
     ESP_LOGI(TAG, "MIPI DSI PHY Powered on (2.5V)");
@@ -48,7 +48,6 @@ static void lcd_bsp_enable_dsi_phy_power(void) {
 esp_lcd_panel_handle_t app_lcd_init(void) {
     ESP_LOGI(TAG, "Initializing EK79007 MIPI-DSI Panel (1024x600)...");
 
-    // 1. 引脚配置
     gpio_config_t gpio_conf = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_OUTPUT,
@@ -58,24 +57,21 @@ esp_lcd_panel_handle_t app_lcd_init(void) {
     };
     gpio_config(&gpio_conf);
 
-    gpio_set_level(LCD_BL_PIN, 0);      // 背光关闭
-    gpio_set_level(LCD_PWREN_PIN, 1);   // 上电
-    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(LCD_BL_PIN, 0);      
+    gpio_set_level(LCD_PWREN_PIN, 1);   
+    vTaskDelay(pdMS_TO_TICKS(100));     
 
-    // 2. DSI PHY 电源
     lcd_bsp_enable_dsi_phy_power();
 
-    // 3. DSI 总线
     esp_lcd_dsi_bus_handle_t mipi_dsi_bus;
     esp_lcd_dsi_bus_config_t bus_config = {
         .bus_id             = 0,
-        .num_data_lanes     = 2,                              // 2 Lane
-        .phy_clk_src        = MIPI_DSI_PHY_PLLREF_CLK_SRC_DEFAULT, // XTAL 晶振
-        .lane_bit_rate_mbps = 900,                            // 900 Mbps (官方 EK79007 配置)
+        .num_data_lanes     = 2,                              
+        .phy_clk_src        = MIPI_DSI_PHY_PLLREF_CLK_SRC_DEFAULT, 
+        .lane_bit_rate_mbps = 700,                            
     };
     ESP_ERROR_CHECK(esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus));
 
-    // 4. DBI 控制面板
     esp_lcd_panel_io_handle_t mipi_dbi_io;
     esp_lcd_dbi_io_config_t dbi_config = {
         .virtual_channel = 0,
@@ -84,7 +80,6 @@ esp_lcd_panel_handle_t app_lcd_init(void) {
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_dbi(mipi_dsi_bus, &dbi_config, &mipi_dbi_io));
 
-    // 5. 复位时序
     gpio_config_t rst_conf = {
         .mode = GPIO_MODE_OUTPUT,
         .pin_bit_mask = (1ULL << LCD_RST_PIN),
@@ -98,7 +93,6 @@ esp_lcd_panel_handle_t app_lcd_init(void) {
     gpio_set_level(LCD_RST_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(120));
 
-    // 发送初始化序列
     ESP_LOGI(TAG, "Sending EK79007 Initialization Commands...");
     for (int i = 0; i < EK79007_INIT_CMD_LEN; i++) {
         ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(mipi_dbi_io, 
@@ -107,36 +101,85 @@ esp_lcd_panel_handle_t app_lcd_init(void) {
                                                    ek79007_init_cmds[i].data_bytes));
     }
 
-    // 6. 创建 DPI 面板 (配置为 RGB888 格式匹配解码输出, 便于零拷贝)
-    // 时序取自官方 EK79007_1024_600_PANEL_60HZ_CONFIG (esp_lcd_ek79007):
-    //   刷新率 = 52MHz / (1024+10+160+160) / (600+1+23+12) ≈ 60.4Hz
-    // 原来的 50MHz/700Mbps + hsw20/vsw10 只有 ≈56.8Hz
     esp_lcd_panel_handle_t mipi_dpi_panel;
     esp_lcd_dpi_panel_config_t dpi_config = {
         .virtual_channel    = 0,
         .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
-        .dpi_clock_freq_mhz = 52,                          // 52MHz -> 60.4Hz
-        .in_color_format    = LCD_COLOR_FMT_RGB888,        // RGB888
-        .out_color_format   = LCD_COLOR_FMT_RGB888,        // RGB888
-        .num_fbs            = 2,                           // 2 帧缓存(零拷贝双缓冲)
+        .dpi_clock_freq_mhz = 50,                          
+        .in_color_format    = LCD_COLOR_FMT_RGB888,        
+        .out_color_format   = LCD_COLOR_FMT_RGB888,       
+        .num_fbs            = 2,                           
         .video_timing       = {
-            .h_size            = 1024,                      // 1024
-            .v_size            = 600,                       // 600
-            .hsync_back_porch  = 160,                      // hbp 160
-            .hsync_front_porch = 160,                      // hfp 160
-            .hsync_pulse_width = 10,                       // hsw 10
-            .vsync_back_porch  = 23,                       // vbp 23
-            .vsync_front_porch = 12,                       // vfp 12
-            .vsync_pulse_width = 1,                        // vsw 1
+            .h_size            = 1024,                      
+            .v_size            = 600,                       
+            .hsync_back_porch  = 160,                      
+            .hsync_front_porch = 160,                      
+            .hsync_pulse_width = 20,                       
+            .vsync_back_porch  = 23,                       
+            .vsync_front_porch = 12,                       
+            .vsync_pulse_width = 10,                       
         },
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_dpi(mipi_dsi_bus, &dpi_config, &mipi_dpi_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(mipi_dpi_panel));
-    // ESP-IDF v6.0 起 use_dma2d 标志被移除，改为单独接口开启 DMA2D 硬件加速
+    /* ESP-IDF v6.0 起 extra_dpi_panel_flags.use_dma2d 被移除, 改用单独接口开 DMA2D */
     ESP_ERROR_CHECK(esp_lcd_dpi_panel_enable_dma2d(mipi_dpi_panel));
 
-    gpio_set_level(LCD_BL_PIN, 1);     // 打开背光
+    gpio_set_level(LCD_BL_PIN, 1);     
     ESP_LOGI(TAG, "LCD Initialization Complete (1024x600 RGB888, DMA2D ON), Backlight ON");
 
     return mipi_dpi_panel;
+}
+
+/* ============================================================================
+ * 颜色自检: 用来判断"红/蓝是否互换"以及"有没有偏色"
+ *   自检条按 LCD_PIXEL_ORDER_BGR 指定的内存字节序写入(与解码端保持一致),
+ *   所以正常应显示 红|绿|蓝; 若显示 蓝|绿|红, 就是开关设反了。
+ *   像素写入统一用 app_pixel.h 里的 app_pixel_put()
+ * ========================================================================== */
+void lcd_color_selftest(esp_lcd_panel_handle_t panel)
+{
+#if LCD_COLOR_SELFTEST
+    if (!panel) {
+        return;
+    }
+
+    const int w = LCD_H_RES;
+    const int h = LCD_V_RES;
+    uint8_t *buf = (uint8_t *)heap_caps_malloc((size_t)w * h * 3, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        ESP_LOGW(TAG, "颜色自检: 内存不足");
+        return;
+    }
+
+    /* 上半屏: 三段竖条 红 / 绿 / 蓝 */
+    for (int y = 0; y < h / 2; y++) {
+        uint8_t *row = buf + (size_t)y * w * 3;
+        for (int x = 0; x < w; x++) {
+            uint8_t *p = row + (size_t)x * 3;
+            if (x < w / 3) {
+                app_pixel_put(p, 255, 0, 0);      /* 红 */
+            } else if (x < (w * 2) / 3) {
+                app_pixel_put(p, 0, 255, 0);      /* 绿 */
+            } else {
+                app_pixel_put(p, 0, 0, 255);      /* 蓝 */
+            }
+        }
+    }
+
+    /* 下半屏: 左白右灰, 用来看有没有整体偏色(BT601/BT709 之类) */
+    for (int y = h / 2; y < h; y++) {
+        uint8_t *row = buf + (size_t)y * w * 3;
+        for (int x = 0; x < w; x++) {
+            uint8_t v = (x < w / 2) ? 255 : 128;
+            app_pixel_put(row + (size_t)x * 3, v, v, v);
+        }
+    }
+
+    ESP_LOGI(TAG, "颜色自检: 上半屏左->右应为 红|绿|蓝, 下半屏左白右灰 (显示成 蓝|绿|红 就是 LCD_PIXEL_ORDER_BGR 设反了)");
+    esp_lcd_panel_draw_bitmap(panel, 0, 0, w, h, buf);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    free(buf);
+#endif
 }
