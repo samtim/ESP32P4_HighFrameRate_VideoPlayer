@@ -1,3 +1,3 @@
 cmake_minimum_required(VERSION 3.16)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(esp32p4_mjpeg_player)
+project(ESP32P4_HighFrameRate_VideoPlayer)

@@ -1,0 +1,10 @@
+## IDF Component Manager Manifest File
+dependencies:
+  ## Required for ESP-IDF core services
+  idf: ">=5.1"
+
+  ## esp_mjpeg_decode 已作为本地组件放在 components/esp_mjpeg_decode,
+  ## 不再从 github 拉取(原 git 依赖: https://github.com/espressif/esp-mjpeg-decoder.git)
+
+  ## Hardware-accelerated JPEG decoder for ESP32-P4
+  espressif/esp_jpeg: "^1.3.0"

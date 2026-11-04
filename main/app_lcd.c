@@ -71,7 +71,7 @@ esp_lcd_panel_handle_t app_lcd_init(void) {
         .bus_id             = 0,
         .num_data_lanes     = 2,                              // 2 Lane
         .phy_clk_src        = MIPI_DSI_PHY_PLLREF_CLK_SRC_DEFAULT, // XTAL 晶振
-        .lane_bit_rate_mbps = 700,                            // 700 Mbps
+        .lane_bit_rate_mbps = 900,                            // 900 Mbps (官方 EK79007 配置)
     };
     ESP_ERROR_CHECK(esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus));
 
@@ -107,31 +107,33 @@ esp_lcd_panel_handle_t app_lcd_init(void) {
                                                    ek79007_init_cmds[i].data_bytes));
     }
 
-    // 6. 创建 DPI 面板 (配置为 RGB888 格式匹配解码输出，开启 DMA2D 加速)
+    // 6. 创建 DPI 面板 (配置为 RGB888 格式匹配解码输出, 便于零拷贝)
+    // 时序取自官方 EK79007_1024_600_PANEL_60HZ_CONFIG (esp_lcd_ek79007):
+    //   刷新率 = 52MHz / (1024+10+160+160) / (600+1+23+12) ≈ 60.4Hz
+    // 原来的 50MHz/700Mbps + hsw20/vsw10 只有 ≈56.8Hz
     esp_lcd_panel_handle_t mipi_dpi_panel;
     esp_lcd_dpi_panel_config_t dpi_config = {
         .virtual_channel    = 0,
         .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
-        .dpi_clock_freq_mhz = 50,                          // 50MHz
+        .dpi_clock_freq_mhz = 52,                          // 52MHz -> 60.4Hz
         .in_color_format    = LCD_COLOR_FMT_RGB888,        // RGB888
-        .out_color_format   = LCD_COLOR_FMT_RGB888,       // RGB888
-        .num_fbs            = 2,                           // 2 帧缓存
+        .out_color_format   = LCD_COLOR_FMT_RGB888,        // RGB888
+        .num_fbs            = 2,                           // 2 帧缓存(零拷贝双缓冲)
         .video_timing       = {
             .h_size            = 1024,                      // 1024
             .v_size            = 600,                       // 600
             .hsync_back_porch  = 160,                      // hbp 160
             .hsync_front_porch = 160,                      // hfp 160
-            .hsync_pulse_width = 20,                       // hsw 20
+            .hsync_pulse_width = 10,                       // hsw 10
             .vsync_back_porch  = 23,                       // vbp 23
             .vsync_front_porch = 12,                       // vfp 12
-            .vsync_pulse_width = 10,                       // vsw 10
-        },
-        .flags = {
-            .use_dma2d = true,                             // 开启 DMA2D 硬件加速
+            .vsync_pulse_width = 1,                        // vsw 1
         },
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_dpi(mipi_dsi_bus, &dpi_config, &mipi_dpi_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(mipi_dpi_panel));
+    // ESP-IDF v6.0 起 use_dma2d 标志被移除，改为单独接口开启 DMA2D 硬件加速
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_enable_dma2d(mipi_dpi_panel));
 
     gpio_set_level(LCD_BL_PIN, 1);     // 打开背光
     ESP_LOGI(TAG, "LCD Initialization Complete (1024x600 RGB888, DMA2D ON), Backlight ON");

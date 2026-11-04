@@ -1,0 +1,26 @@
+tmp/
+# 自己的组件(esp_mjpeg_decode / minimp3)必须入库, 否则别人 clone 下来编译不了;
+# 只有组件管理器自动下载的 managed_components 才忽略
+managed_components/
+build/
+.vscode/
+.devcontainer/
+sdkconfig.old
+sdkconfig
+dependencies.lock
+.env
+releases/
+main/assets/lang_config.h
+main/mmap_generate_emoji.h
+.DS_Store
+.cache
+main/mmap_generate_emoji.h
+*.pyc
+*.bin
+mmap_generate_*.h
+# 这两个是厂商 WiFi 例程(03_WiFi_AP)里的托管组件, 体积大(约 20MB), 不入库
+# 需要时从厂商资料包 3.程序源码/03_WiFi_AP/managed_components 拷贝并去掉里面的 idf_component.yml
+components/esp_hosted/
+components/esp_wifi_remote/
+components/esp_serial_slave_link/
+components/eppp_link/
