@@ -10,5 +10,5 @@ idf_component_register(
         "app_video.c"
     INCLUDE_DIRS 
         "."
-    REQUIRES esp_mjpeg_decode esp_driver_sdmmc esp_lcd esp_timer fatfs esp_driver_gpio esp_hw_support esp_driver_i2s esp_driver_i2c esp_ringbuf minimp3
+    REQUIRES esp_mjpeg_decode esp_driver_sdmmc esp_lcd esp_timer fatfs esp_driver_gpio esp_hw_support esp_driver_i2s esp_driver_i2c esp_ringbuf minimp3 espressif__esp_audio_effects
 )

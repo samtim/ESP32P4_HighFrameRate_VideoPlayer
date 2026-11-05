@@ -28,6 +28,7 @@
 #include "freertos/ringbuf.h"
 
 #include "minimp3.h"
+#include "esp_ae_sonic.h"
 
 #include "app_audio.h"
 #include "app_es8311.h"
@@ -100,9 +101,113 @@ static volatile bool     s_source_error      = false;
 static volatile bool     s_source_running    = false;
 static volatile bool     s_player_running    = false;
 static volatile uint32_t s_underruns         = 0;
-static volatile int64_t  s_clock_start_us    = 0;
 static volatile bool     s_paused            = false;
-static volatile int64_t  s_pause_ts_us       = 0;
+
+/* --- 变速不变调 (sonic) + 媒体主时钟 -------------------------------------
+ * 时钟算法(闭环): 以"真正送进 I2S 的音频采样数"为基准 ——
+ *   媒体时间 = 锚点媒体位置 + (now - 锚点墙钟) * 倍率
+ * 每送出一块 PCM 就用真实的已消耗样点数把锚点重新定一次, 所以:
+ *   - sonic 的实际收发比哪怕和设定倍率有细微偏差, 也只能造成一个块(≈20ms)的
+ *     瞬间误差, 不会随时间累积(老做法纯按墙钟×倍率估算, 偏差会累计成失步);
+ *   - 加/减档、暂停都只是把锚点按"当前媒体位置"重设, 时钟连续、不跳变;
+ *   - 锚点墙钟为 0 表示冻结(暂停中), 此时只返回锚点媒体位置。
+ */
+static const float      k_speed_factor[] = { 0.5f, 0.75f, 1.0f, 1.25f, 1.5f };
+static volatile int      s_speed_step    = APP_AUDIO_SPEED_STEP_DEFAULT;
+static volatile float    s_speed         = 1.0f;
+static volatile int64_t  s_clock_base_us = 0;   /* 锚点处的媒体位置(µs) */
+static volatile int64_t  s_clock_anchor_us = 0; /* 锚点墙钟(0 = 冻结) */
+static volatile bool     s_clock_started = false;
+static volatile uint64_t s_media_samples = 0;   /* 已送出的媒体样点数(= 立体声帧数) */
+static uint32_t          s_clock_rate    = 0;   /* 采样率, 0 表示没有音频(用墙钟兜底) */
+static esp_ae_sonic_handle_t s_sonic     = NULL;
+static uint32_t          s_sonic_rate    = 0;
+static SemaphoreHandle_t s_speed_mutex   = NULL;   /* 保护 sonic 与倍率切换(跨任务) */
+
+/* ============================================================================
+ * 倍速 + 媒体时钟
+ * ========================================================================== */
+static float speed_factor_of_step(int step)
+{
+    if (step < APP_AUDIO_SPEED_STEP_MIN) step = APP_AUDIO_SPEED_STEP_MIN;
+    if (step > APP_AUDIO_SPEED_STEP_MAX) step = APP_AUDIO_SPEED_STEP_MAX;
+    return k_speed_factor[step - 1];
+}
+
+/* 当前媒体时间(µs): 锚点位置 + 锚点以来按倍率走过的时长 */
+static int64_t clock_now_us(void)
+{
+    int64_t base = s_clock_base_us;
+    int64_t anchor = s_clock_anchor_us;
+    if (anchor != 0) {
+        int64_t now = esp_timer_get_time();
+        if (now > anchor) {
+            base += (int64_t)((double)(now - anchor) * (double)s_speed);
+        }
+    }
+    return base;
+}
+
+/* 音频任务每送出一块 PCM 调用一次: 用真实消耗的样点数校正媒体位置 */
+static void clock_sync_to_samples(void)
+{
+    if (s_clock_rate == 0) {
+        return;
+    }
+    int64_t media_us = (int64_t)((uint64_t)s_media_samples * 1000000ULL / (uint64_t)s_clock_rate);
+    s_clock_base_us = media_us;
+    s_clock_anchor_us = s_paused ? 0 : esp_timer_get_time();
+}
+
+void app_audio_set_speed_step(int step)
+{
+    if (step < APP_AUDIO_SPEED_STEP_MIN) {
+        step = APP_AUDIO_SPEED_STEP_MIN;
+    } else if (step > APP_AUDIO_SPEED_STEP_MAX) {
+        step = APP_AUDIO_SPEED_STEP_MAX;
+    }
+
+    float factor = speed_factor_of_step(step);
+
+    /* 和播放任务里的 sonic 处理互斥: 保证倍率切换只发生在两次处理之间,
+     * 不会出现"时钟已经按新倍率走、音频还是旧倍率"的瞬间 */
+    if (s_speed_mutex) {
+        xSemaphoreTake(s_speed_mutex, portMAX_DELAY);
+    }
+
+    /* 换倍率前先把当前媒体位置固定下来(用旧倍率算到此刻), 之后按新倍率继续插值 */
+    int64_t cur = clock_now_us();
+    s_clock_base_us = cur;
+    s_clock_anchor_us = s_paused ? 0 : esp_timer_get_time();
+
+    if (s_sonic) {
+        esp_ae_err_t err = esp_ae_sonic_set_speed(s_sonic, factor);
+        if (err != ESP_AE_ERR_OK) {
+            ESP_LOGE(TAG, "sonic 设置倍率失败(%d), 回退到 100%%", (int)err);
+            factor = 1.0f;
+            esp_ae_sonic_set_speed(s_sonic, factor);
+        }
+    }
+
+    s_speed_step = step;
+    s_speed = factor;
+
+    if (s_speed_mutex) {
+        xSemaphoreGive(s_speed_mutex);
+    }
+
+    ESP_LOGI(TAG, "播放速度: 第 %d 档 (%d%%)", s_speed_step, (int)(factor * 100.0f + 0.5f));
+}
+
+int app_audio_get_speed_step(void)
+{
+    return s_speed_step;
+}
+
+float app_audio_get_speed_factor(void)
+{
+    return s_speed;
+}
 
 /* ============================================================================
  * 小工具
@@ -495,6 +600,34 @@ static void audio_player_task(void *pvParameters)
     /* 采样率要等探测结果出来后再设 (I2S 时钟 + ES8311 在 slave 下无需改寄存器) */
     app_audio_hw_set_rate(s_src.info.sample_rate);
 
+    /* 变速不变调: 建 sonic (采样率必须是 4000 或 11025 的整数倍) */
+    uint32_t rate = s_src.info.sample_rate;
+    if (s_sonic && s_sonic_rate != rate) {
+        esp_ae_sonic_close(s_sonic);
+        s_sonic = NULL;
+    }
+    if (s_sonic == NULL) {
+        esp_ae_sonic_cfg_t sonic_cfg = {
+            .sample_rate     = rate,
+            .channel         = 2,       /* 环形缓冲里统一是立体声 */
+            .bits_per_sample = 16,
+        };
+        esp_ae_err_t ae = esp_ae_sonic_open(&sonic_cfg, &s_sonic);
+        if (ae != ESP_AE_ERR_OK) {
+            s_sonic = NULL;
+            ESP_LOGE(TAG, "sonic 初始化失败(%d): %" PRIu32 " Hz 不支持变速, 锁在 100%%", (int)ae, rate);
+            /* 不能只让视频变速而音频不变速, 否则音视频就失步了 -> 强制回到 100% */
+            app_audio_set_speed_step(APP_AUDIO_SPEED_STEP_DEFAULT);
+        } else {
+            s_sonic_rate = rate;
+            esp_ae_sonic_reset(s_sonic);
+            esp_ae_sonic_set_speed(s_sonic, s_speed);
+        }
+    } else {
+        esp_ae_sonic_reset(s_sonic);
+        esp_ae_sonic_set_speed(s_sonic, s_speed);
+    }
+
     /* 预填充: 先把缓冲垫起来再起播, 这样开头不会有空洞
      * MP3 需要先解码一会儿, 所以时间上限放宽一些 */
     int64_t t_fill = esp_timer_get_time();
@@ -511,14 +644,22 @@ static void audio_player_task(void *pvParameters)
     }
 
     app_audio_hw_pa_enable(true);
-    s_clock_start_us = esp_timer_get_time();
-    ESP_LOGI(TAG, "开始播放音频: %s (%" PRIu32 " Hz / %u ch)",
-             path, s_src.info.sample_rate, s_src.info.channels);
+    s_media_samples   = 0;
+    s_clock_rate      = s_src.info.sample_rate;
+    s_clock_base_us   = 0;
+    s_clock_anchor_us = esp_timer_get_time();
+    s_clock_started   = true;
+    ESP_LOGI(TAG, "开始播放音频: %s (%" PRIu32 " Hz / %u ch, %d%%)",
+             path, s_src.info.sample_rate, s_src.info.channels, (int)(s_speed * 100.0f + 0.5f));
 
     {
-        static uint8_t pcm_buf[AUDIO_RECV_CHUNK];   /* 内部 RAM, 供 I2S 拷贝 */
+        static uint8_t pcm_in[AUDIO_RECV_CHUNK];        /* 内部 RAM: 环形缓冲取出的 PCM */
+        static uint8_t pcm_out[AUDIO_RECV_CHUNK];       /* 内部 RAM: sonic 输出 */
         size_t bytes_written = 0;
         size_t total_bytes = 0;
+
+        /* sonic 每次要多少个输出样点(立体声 16bit: 1 样点 = 4 字节) */
+        const uint32_t out_need = AUDIO_RECV_CHUNK / 4;
 
         while (!s_stop) {
             if (s_paused) {
@@ -539,7 +680,7 @@ static void audio_player_task(void *pvParameters)
 
             item_size &= ~(size_t)1;                    /* 16bit 对齐 */
             if (item_size > 0) {
-                memcpy(pcm_buf, data, item_size);
+                memcpy(pcm_in, data, item_size);
             }
             vRingbufferReturnItem(s_ringbuf, data);
 
@@ -547,14 +688,76 @@ static void audio_player_task(void *pvParameters)
                 continue;
             }
 
-            if (i2s_channel_write(app_audio_hw_tx_handle(), pcm_buf, item_size, &bytes_written,
-                                  pdMS_TO_TICKS(1000)) != ESP_OK) {
-                ESP_LOGW(TAG, "i2s_channel_write 失败");
-                break;
+            if (s_sonic == NULL) {
+                /* 没有 sonic: 直通(理论上不会走到, 保底能出声) */
+                if (i2s_channel_write(app_audio_hw_tx_handle(), pcm_in, item_size, &bytes_written,
+                                      pdMS_TO_TICKS(1000)) != ESP_OK) {
+                    ESP_LOGW(TAG, "i2s_channel_write 失败");
+                    break;
+                }
+                total_bytes += bytes_written;
+                s_media_samples += (uint64_t)(item_size / 4);
+                clock_sync_to_samples();
+                continue;
             }
-            total_bytes += bytes_written;
+
+            /* 变速不变调: 输入一块 PCM, 反复取输出直到输入被吃光、内部缓存也空 */
+            uint32_t remain = (uint32_t)(item_size / 4);
+            uint8_t *in_ptr = pcm_in;
+            uint32_t cached = 1;            /* 先假设还有缓存, 至少进一次循环 */
+            uint32_t consumed = 0;          /* 这块数据实际被 sonic 吃掉的样点数 */
+            while ((remain > 0 || cached > 0) && !s_stop) {
+                esp_ae_sonic_in_data_t in_data = {
+                    .samples     = in_ptr,
+                    .num         = remain,
+                    .consume_num = 0,
+                };
+                esp_ae_sonic_out_data_t out_data = {
+                    .samples    = pcm_out,
+                    .needed_num = out_need,
+                    .out_num    = 0,
+                };
+                esp_ae_err_t ae;
+                if (s_speed_mutex) {
+                    xSemaphoreTake(s_speed_mutex, portMAX_DELAY);
+                }
+                ae = esp_ae_sonic_process(s_sonic, &in_data, &out_data);
+                if (s_speed_mutex) {
+                    xSemaphoreGive(s_speed_mutex);
+                }
+                if (ae != ESP_AE_ERR_OK) {
+                    ESP_LOGW(TAG, "sonic 处理失败(%d)", (int)ae);
+                    goto player_done;
+                }
+
+                if (in_data.consume_num > 0) {
+                    in_ptr += (size_t)in_data.consume_num * 4;
+                    remain -= in_data.consume_num;
+                    consumed += in_data.consume_num;
+                }
+
+                if (out_data.out_num > 0) {
+                    size_t bytes = (size_t)out_data.out_num * 4;
+                    if (i2s_channel_write(app_audio_hw_tx_handle(), pcm_out, bytes, &bytes_written,
+                                          pdMS_TO_TICKS(1000)) != ESP_OK) {
+                        ESP_LOGW(TAG, "i2s_channel_write 失败");
+                        goto player_done;
+                    }
+                    total_bytes += bytes_written;
+                }
+
+                cached = out_data.out_num;
+                if (in_data.consume_num == 0 && out_data.out_num == 0) {
+                    break;      /* 吃不动也吐不出, 防止死循环 */
+                }
+            }
+
+            /* 用真实消耗的样点数把媒体时钟锚点校正一次(闭环, 不会积累漂移) */
+            s_media_samples += consumed;
+            clock_sync_to_samples();
         }
 
+player_done:
         ESP_LOGI(TAG, "播放结束: 写入 %u 字节 (~%u 秒), 缓冲欠载 %u 次",
                  (unsigned)total_bytes,
                  (unsigned)(total_bytes / (s_src.info.sample_rate * 4)),
@@ -570,9 +773,12 @@ exit:
     if (f_audio) {
         fclose(f_audio);
     }
-    if (s_clock_start_us == 0) {
-        /* 音频不可用时也要给个时钟, 让视频改用系统定时器继续播 */
-        s_clock_start_us = esp_timer_get_time();
+    if (!s_clock_started) {
+        /* 音频不可用时也要给个时钟, 让视频改用系统定时器继续播(仍按档位变速) */
+        s_clock_rate      = 0;
+        s_clock_base_us   = 0;
+        s_clock_anchor_us = esp_timer_get_time();
+        s_clock_started   = true;
     }
     s_player_running = false;
     vTaskDelete(NULL);
@@ -593,6 +799,13 @@ esp_err_t app_audio_play(const char *media_path)
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 
+    if (s_speed_mutex == NULL) {
+        s_speed_mutex = xSemaphoreCreateMutex();
+        if (s_speed_mutex == NULL) {
+            ESP_LOGE(TAG, "创建倍速互斥量失败, 不能变速");
+        }
+    }
+
     strlcpy(s_media_path, media_path, sizeof(s_media_path));
 
     s_stop           = false;
@@ -600,9 +813,12 @@ esp_err_t app_audio_play(const char *media_path)
     s_info_ready     = false;
     s_source_error   = false;
     s_underruns      = 0;
-    s_clock_start_us = 0;
+    s_clock_base_us   = 0;
+    s_clock_anchor_us = 0;
+    s_clock_started   = false;
+    s_media_samples   = 0;
+    s_clock_rate      = 0;
     s_paused         = false;
-    s_pause_ts_us    = 0;
     s_player_running = true;
 
     if (xTaskCreatePinnedToCore(audio_player_task, "audio_player", AUDIO_PLAYER_STACK, NULL,
@@ -625,15 +841,14 @@ void app_audio_set_paused(bool paused)
         return;
     }
     if (paused) {
-        s_pause_ts_us = esp_timer_get_time();
+        /* 把当前媒体位置固定下来, 然后冻结(锚点墙钟清零), 暂停时间不计入 */
+        s_clock_base_us = clock_now_us();
+        s_clock_anchor_us = 0;
         s_paused = true;
         ESP_LOGI(TAG, "暂停");
     } else {
-        /* 把暂停期间的时长补回时钟起点, 保证音视频同步不漂 */
-        if (s_pause_ts_us != 0 && s_clock_start_us != 0) {
-            s_clock_start_us += (esp_timer_get_time() - s_pause_ts_us);
-        }
-        s_pause_ts_us = 0;
+        /* 从冻结的媒体位置接着插值, 暂停期间不计入 */
+        s_clock_anchor_us = esp_timer_get_time();
         s_paused = false;
         ESP_LOGI(TAG, "继续");
     }
@@ -646,11 +861,10 @@ bool app_audio_is_paused(void)
 
 int64_t app_audio_get_clock_us(void)
 {
-    int64_t start = s_clock_start_us;
-    if (start == 0) {
+    if (!s_clock_started) {
         return 0;
     }
-    return esp_timer_get_time() - start;
+    return clock_now_us();
 }
 
 bool app_audio_is_playing(void)

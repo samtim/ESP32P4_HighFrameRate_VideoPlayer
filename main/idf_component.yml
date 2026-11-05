@@ -8,3 +8,6 @@ dependencies:
 
   ## Hardware-accelerated JPEG decoder for ESP32-P4
   espressif/esp_jpeg: "^1.3.0"
+
+  ## 变速不变调: 用 esp_ae_sonic (ESP Player / esp_audio_render 的变速也是这个模块)
+  espressif/esp_audio_effects: "^1.4.4"

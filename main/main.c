@@ -22,6 +22,7 @@
 
 #include "app_lcd.h"
 #include "app_sdcard.h"
+#include "app_audio.h"
 #include "app_es8311.h"
 #include "app_display.h"
 #include "app_keys.h"
@@ -51,6 +52,10 @@ void app_main(void)
     /* 4. 视频解码引擎 + 按键 */
     ESP_ERROR_CHECK(app_video_init());
     app_keys_start();
+
+    ESP_LOGI(TAG, "播放速度: 第 %d 档 (%d%%), GPIO%d 加速 / GPIO%d 减速",
+             app_audio_get_speed_step(), (int)(app_audio_get_speed_factor() * 100.0f + 0.5f),
+             APP_KEY_SPEED_UP_GPIO, APP_KEY_SPEED_DOWN_GPIO);
 
     /* 5. 一直循环播放这一个文件 */
     while (1) {

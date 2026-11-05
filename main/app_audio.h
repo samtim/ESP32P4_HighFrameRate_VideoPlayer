@@ -42,9 +42,11 @@ esp_err_t app_audio_play(const char *media_path);
 void app_audio_stop(void);
 
 /**
- * @brief  音频主时钟 (微秒)
- * @return 播放开始前返回 0, 播放开始后返回自起播以来的微秒数
- * @note   找不到/无法解析 WAV 时, 也会在起播时刻返回非 0 (用系统定时器兜底), 保证视频照常同步
+ * @brief  音频主时钟 (媒体时间, 微秒)
+ * @return 播放开始前返回 0; 播放开始后返回"已送进 I2S 的音频对应的媒体位置"
+ * @note   这个值是**闭环**的: 每送出一块 PCM 就用真实消耗的样点数校正一次,
+ *         并且按当前倍速推进, 所以变速后不会积累漂移。
+ *         找不到音频文件时用系统定时器兜底(同样按倍速推进), 保证视频照常同步。
  */
 int64_t app_audio_get_clock_us(void);
 
@@ -60,5 +62,27 @@ void app_audio_set_paused(bool paused);
 
 /** @brief 是否处于暂停状态 */
 bool app_audio_is_paused(void);
+
+/* ============================================================================
+ * 播放速度 (变速不变调, 用 esp_ae_sonic)
+ *   档位 1..5  ->  50% / 75% / 100% / 125% / 150%
+ *   开机默认第 3 档(100%); 档位在整机运行期间保持, 换文件不重置
+ * ========================================================================== */
+#define APP_AUDIO_SPEED_STEP_MIN        1
+#define APP_AUDIO_SPEED_STEP_MAX        5
+#define APP_AUDIO_SPEED_STEP_DEFAULT    3
+
+/**
+ * @brief  设置播放档位 (自动裁剪到 1..5)
+ * @note   立即生效: 音频走 sonic 变速不变调, 音频主时钟按新倍率累加,
+ *         视频端用同一个时钟做 A/V 同步, 所以音视频同时加/减档且不会失步
+ */
+void app_audio_set_speed_step(int step);
+
+/** @brief 当前档位 (1..5) */
+int app_audio_get_speed_step(void);
+
+/** @brief 当前倍率 (0.5 / 0.75 / 1.0 / 1.25 / 1.5) */
+float app_audio_get_speed_factor(void);
 
 #endif /* __APP_AUDIO_H_ */

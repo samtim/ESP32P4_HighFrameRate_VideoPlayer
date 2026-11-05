@@ -254,6 +254,12 @@ app_video_result_t app_video_play(const char *path)
                 s_paused = !s_paused;
                 app_audio_set_paused(s_paused);
                 ESP_LOGI(TAG, "按键: %s", s_paused ? "暂停" : "继续");
+            } else if (ev == APP_KEY_SPEED_UP) {
+                /* 加档: 音频走 sonic 变速不变调, 媒体时钟按新倍率累加;
+                 * 视频用同一个时钟做 A/V 同步, 所以音视频一起加速 */
+                app_audio_set_speed_step(app_audio_get_speed_step() + 1);
+            } else if (ev == APP_KEY_SPEED_DOWN) {
+                app_audio_set_speed_step(app_audio_get_speed_step() - 1);
             }
 
             if (s_paused) {
@@ -327,12 +333,19 @@ app_video_result_t app_video_play(const char *path)
                             }
                         }
                     } else {
+                        /* 等到"该显示这一帧"的时刻再解码刷屏。
+                         * 注意慢速档一帧要等得比一个帧间隔更长(50% 档约 83ms/帧),
+                         * 所以这里不能把等待截断成 1 帧间隔 —— 否则视频最多只能降到
+                         * ~20fps, 而音频按 12fps 走, 画面会一路跑到音频前面去(越差越多)。
+                         * 这里按实际差值等待, 只加 500ms 上限防止异常情况下卡太久,
+                         * 并且 20ms 分片, 播完/换曲能及时反应。 */
                         if (diff > 1000) {
-                            int64_t sleep_ms = diff / 1000;
-                            if (sleep_ms > FRAME_INTERVAL_US / 1000) {
-                                sleep_ms = FRAME_INTERVAL_US / 1000;
+                            int64_t wait_us = diff > 500000 ? 500000 : diff;
+                            while (wait_us > 0 && !s_finished) {
+                                int64_t slice_us = wait_us > 20000 ? 20000 : wait_us;
+                                vTaskDelay(pdMS_TO_TICKS((slice_us + 999) / 1000));
+                                wait_us -= slice_us;
                             }
-                            vTaskDelay(pdMS_TO_TICKS(sleep_ms));
                         }
 
                         uint32_t actual = 0;
@@ -353,9 +366,12 @@ app_video_result_t app_video_play(const char *path)
                     }
 
                     int64_t now = esp_timer_get_time();
-                    if (now - last_fps >= 10000000) {   /* 每 10 秒一条, 不显示同步差 */
-                        ESP_LOGI(TAG, "FPS: %.2f | 已播 %" PRIu32 " 帧 | 丢 %" PRIu32 " 帧",
-                                 (float)fps_count * 1000000.0f / (now - last_fps), fps_count, skipped);
+                    if (now - last_fps >= 10000000) {
+                        /* diff = 本帧媒体 PTS - 音频时钟:
+                         *   正数=画面在等音频, 负数=画面落后; 稳态应在 ±1 帧(±42ms) 内 */
+                        ESP_LOGI(TAG, "FPS: %.2f (第 %d 档) | 已播 %" PRIu32 " 帧 | 丢 %" PRIu32 " 帧 | A/V 差 %+d ms",
+                                 (float)fps_count * 1000000.0f / (now - last_fps),
+                                 app_audio_get_speed_step(), fps_count, skipped, (int)(diff / 1000));
                         fps_count = 0;
                         last_fps = now;
                     }

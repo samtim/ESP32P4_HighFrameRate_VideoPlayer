@@ -3114,6 +3114,11 @@ CONFIG_WL_SECTOR_SIZE=4096
 # end of Wear Levelling
 
 #
+# Audio Effects Configuration
+#
+# end of Audio Effects Configuration
+
+#
 # JPEG Decoder
 #
 # default:
@@ -3139,6 +3144,11 @@ CONFIG_JD_FASTDECODE_32BIT=y
 # default:
 # CONFIG_JD_DEFAULT_HUFFMAN is not set
 # end of JPEG Decoder
+
+#
+# GMF FFT Configuration
+#
+# end of GMF FFT Configuration
 # end of Component config
 
 # CONFIG_IDF_EXPERIMENTAL_FEATURES is not set
