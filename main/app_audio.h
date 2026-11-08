@@ -28,13 +28,35 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #include "esp_err.h"
 
+/* 媒体路径缓冲长度 */
+#define APP_AUDIO_PATH_LEN      128
+
 /**
- * @brief  开始播放 "<media_path 去掉扩展名>.wav"
- * @param  media_path 视频文件路径, 函数内部只替换扩展名为 .wav
- * @note   立即返回, 播放由内部任务完成; 找不到 WAV 时会打警告并让视频改用系统定时器同步
+ * @brief  取视频路径"去掉扩展名"的部分 (目录名里的点不算扩展名)
+ * @param  media_path 视频路径, 例如 /sdcard/600L.mjpeg
+ * @param  base       输出, 例如 /sdcard/600L
+ */
+void app_audio_make_base(const char *media_path, char *base, size_t base_size);
+
+/**
+ * @brief  找视频对应的**同名**音频: 先 xxx.wav, 再 xxx.mp3 (文件必须存在且非空)
+ * @param  media_path 视频路径
+ * @param  out_path   找到时输出音频完整路径; 可为 NULL(只查询)
+ * @param  out_size   out_path 缓冲长度
+ * @return true = 找到了同名音频
+ * @note   视频和音频必须同名成对; 配对失败就不该播这个视频, 否则画面和声音对不上
+ */
+bool app_audio_find_pair(const char *media_path, char *out_path, size_t out_size);
+
+/**
+ * @brief  开始播放与 media_path **同名**的音频
+ * @param  media_path 视频文件路径, 函数内部替换扩展名为 .wav/.mp3
+ * @note   立即返回, 播放由内部任务完成; 找不到音频时会打警告并让视频改用系统定时器同步
+ *         (正常情况下调用方应该先用 app_audio_find_pair() 确认成对再播)
  */
 esp_err_t app_audio_play(const char *media_path);
 
@@ -43,12 +65,20 @@ void app_audio_stop(void);
 
 /**
  * @brief  音频主时钟 (媒体时间, 微秒)
- * @return 播放开始前返回 0; 播放开始后返回"已送进 I2S 的音频对应的媒体位置"
+ * @return 播放开始前返回 0; 播放开始后返回"当前应该听到的声音对应的媒体位置"
  * @note   这个值是**闭环**的: 每送出一块 PCM 就用真实消耗的样点数校正一次,
  *         并且按当前倍速推进, 所以变速后不会积累漂移。
+ *         另外会扣掉 I2S DMA 里还压着的音频(那部分还没真正响出来),
+ *         所以画面是和"听到的声音"对齐的, 不是和"送进去的数据"对齐。
  *         找不到音频文件时用系统定时器兜底(同样按倍速推进), 保证视频照常同步。
  */
 int64_t app_audio_get_clock_us(void);
+
+/**
+ * @brief 当前估计的输出延迟(媒体时间, 微秒): I2S DMA 里压着的音频折算成媒体时长
+ * @note  仅用于日志观察; 关闭 AUDIO_LATENCY_COMP_ENABLE 时恒为 0
+ */
+int32_t app_audio_get_output_lag_us(void);
 
 /** @brief 是否正在播放 */
 bool app_audio_is_playing(void);

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <sys/stat.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -45,7 +46,14 @@ static const char *TAG = "app_audio";
 
 #define AUDIO_PLAYER_STACK      6144
 #define AUDIO_PLAYER_PRIO       6              /* 高于视频读盘(5), 保证喂 DMA 不被抢 */
-#define AUDIO_PLAYER_CORE       0              /* 跟视频解码同一个核 */
+/* 播放任务(含 sonic 变速运算)挪到 core 1:
+ * core 0 留给视频的 JPEG 硬件解码, 150% 高速档才不会因为抢 CPU 丢帧 */
+#define AUDIO_PLAYER_CORE       1
+
+/* A/V 对齐: 送进 I2S 的音频还压在 DMA 里, 真正响出来要等这些帧播完。
+ * 打开后会把媒体时钟往回拨"DMA 里的帧数 / 采样率 × 倍率", 让画面和听到的声音对齐。
+ * 若实测画面偏慢/偏快, 把这里改成 0 关掉即可。 */
+#define AUDIO_LATENCY_COMP_ENABLE   1
 
 /* MP3 解码需要 ~17KB 栈: minimp3 的 mp3dec_decode_frame 在栈上放了一个
  * mp3dec_scratch_t (maindata 2815 + grbuf 4608 + syn 8448 + ... ≈ 16.3KB),
@@ -91,7 +99,7 @@ typedef struct {
  * 模块状态
  * ========================================================================== */
 static RingbufHandle_t  s_ringbuf        = NULL;
-static char             s_media_path[128];
+static char             s_media_path[APP_AUDIO_PATH_LEN];
 static audio_src_t      s_src;
 
 static volatile bool     s_stop              = false;
@@ -123,6 +131,10 @@ static uint32_t          s_clock_rate    = 0;   /* 采样率, 0 表示没有音�
 static esp_ae_sonic_handle_t s_sonic     = NULL;
 static uint32_t          s_sonic_rate    = 0;
 static SemaphoreHandle_t s_speed_mutex   = NULL;   /* 保护 sonic 与倍率切换(跨任务) */
+
+/* 音频输出延迟估计: I2S DMA 里还压着多少帧(用来把媒体时钟对齐"听到的声音") */
+static volatile int32_t  s_dma_fill_frames = 0;
+static uint32_t          s_dma_cap_frames  = 0;
 
 /* ============================================================================
  * 倍速 + 媒体时钟
@@ -157,6 +169,37 @@ static void clock_sync_to_samples(void)
     int64_t media_us = (int64_t)((uint64_t)s_media_samples * 1000000ULL / (uint64_t)s_clock_rate);
     s_clock_base_us = media_us;
     s_clock_anchor_us = s_paused ? 0 : esp_timer_get_time();
+}
+
+/* 写 I2S, 同时用"这次写阻塞了多久"反推 DMA 里还压着多少帧:
+ *   写阻塞时长 dt = (DMA 已有 + 本次写入 - 容量) / 采样率
+ *   => 已有 = 容量 + dt*采样率 - 本次写入
+ * 只有这一个量能真实反映"声音比数据晚多少", 用于 A/V 对齐。 */
+static esp_err_t audio_dma_write(const void *buf, size_t bytes, size_t *written)
+{
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t err = i2s_channel_write(app_audio_hw_tx_handle(), buf, bytes, written,
+                                      pdMS_TO_TICKS(1000));
+    int64_t dt = esp_timer_get_time() - t0;
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (s_dma_cap_frames && s_clock_rate && written && *written && dt >= 2000) {
+        /* 只有"写被阻塞过"才说明 DMA 满了, 这时才能反推; 没阻塞(刚起播)就不要采信 */
+        int64_t w_frames = (int64_t)(*written / 4);      /* 立体声 16bit: 1 帧 = 4 字节 */
+        int64_t fill = (int64_t)s_dma_cap_frames
+                     + dt * (int64_t)s_clock_rate / 1000000
+                     - w_frames;
+        if (fill < 0) {
+            fill = 0;
+        } else if (fill > (int64_t)s_dma_cap_frames) {
+            fill = (int64_t)s_dma_cap_frames;
+        }
+        /* 一阶低通: DMA 是按描述符(512 帧)释放的, 单次测量有抖动 */
+        s_dma_fill_frames = (int32_t)((3 * (int64_t)s_dma_fill_frames + fill) / 4);
+    }
+    return ESP_OK;
 }
 
 void app_audio_set_speed_step(int step)
@@ -521,6 +564,47 @@ static void audio_source_task(void *pvParameters)
 }
 
 /* ============================================================================
+ * 同名音频查找: 视频 xxx.mjpeg -> xxx.wav (优先) / xxx.mp3
+ * ========================================================================== */
+void app_audio_make_base(const char *media_path, char *base, size_t base_size)
+{
+    if (!base || base_size == 0) {
+        return;
+    }
+    snprintf(base, base_size, "%s", media_path ? media_path : "");
+    char *dot = strrchr(base, '.');
+    char *slash = strrchr(base, '/');
+    if (dot && (!slash || dot > slash)) {      /* 只去掉最后一段扩展名, 别把目录里的点当扩展名 */
+        *dot = '\0';
+    }
+}
+
+bool app_audio_find_pair(const char *media_path, char *out_path, size_t out_size)
+{
+    static const char *const exts[] = {".wav", ".mp3"};
+    char base[APP_AUDIO_PATH_LEN];
+
+    if (!media_path || !media_path[0]) {
+        return false;
+    }
+    app_audio_make_base(media_path, base, sizeof(base));
+
+    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+        char path[APP_AUDIO_PATH_LEN + 8];
+        snprintf(path, sizeof(path), "%s%s", base, exts[i]);
+
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+            if (out_path && out_size) {
+                snprintf(out_path, out_size, "%s", path);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ============================================================================
  * 播放任务: 环形缓冲 -> I2S (只做搬运, 不做解码)
  * ========================================================================== */
 static void audio_player_task(void *pvParameters)
@@ -528,22 +612,20 @@ static void audio_player_task(void *pvParameters)
     (void)pvParameters;
 
     char base[sizeof(s_media_path)];
-    strlcpy(base, s_media_path, sizeof(base));
-    char *dot = strrchr(base, '.');
-    if (dot) {
-        *dot = '\0';                           /* 去掉视频扩展名, 换成音频扩展名 */
-    }
+    app_audio_make_base(s_media_path, base, sizeof(base));
 
-    /* 优先 .wav(无损), 没有再找 .mp3 */
-    static const char *const exts[] = {".wav", ".mp3"};
-    char path[sizeof(s_media_path) + 8];
+    /* 声明放在所有 goto 之前, 避免 exit 路径上引用未初始化的指针 */
     FILE *f_audio = NULL;
-    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]) && f_audio == NULL; i++) {
-        snprintf(path, sizeof(path), "%s%s", base, exts[i]);
-        f_audio = fopen(path, "rb");
+
+    /* 同名配对: xxx.wav 优先, 其次 xxx.mp3; 两个都没有就不出声 */
+    char path[APP_AUDIO_PATH_LEN + 8];
+    if (!app_audio_find_pair(s_media_path, path, sizeof(path))) {
+        ESP_LOGW(TAG, "找不到与 %s 同名的音频(%s.wav / %s.mp3)", s_media_path, base, base);
+        goto exit;
     }
+    f_audio = fopen(path, "rb");
     if (!f_audio) {
-        ESP_LOGW(TAG, "找不到音频文件: %s.wav / %s.mp3 -> 改用系统定时器做音视频时钟(无声)", base, base);
+        ESP_LOGW(TAG, "音频文件打不开: %s", path);
         goto exit;
     }
 
@@ -649,8 +731,20 @@ static void audio_player_task(void *pvParameters)
     s_clock_base_us   = 0;
     s_clock_anchor_us = esp_timer_get_time();
     s_clock_started   = true;
-    ESP_LOGI(TAG, "开始播放音频: %s (%" PRIu32 " Hz / %u ch, %d%%)",
-             path, s_src.info.sample_rate, s_src.info.channels, (int)(s_speed * 100.0f + 0.5f));
+
+    /* 查一下 I2S DMA 有多深: 用来估计"声音比送进去的数据晚多少" */
+    i2s_chan_info_t chan_info;
+    s_dma_cap_frames = 0;
+    if (i2s_channel_get_info(app_audio_hw_tx_handle(), &chan_info) == ESP_OK &&
+        chan_info.total_dma_buf_size > 0) {
+        s_dma_cap_frames = chan_info.total_dma_buf_size / 4;   /* 立体声 16bit: 1 帧 = 4 字节 */
+    }
+    s_dma_fill_frames = 0;
+
+    ESP_LOGI(TAG, "开始播放音频: %s (%" PRIu32 " Hz / %u ch, %d%%), I2S DMA %u 帧(约 %u ms)",
+             path, s_src.info.sample_rate, s_src.info.channels, (int)(s_speed * 100.0f + 0.5f),
+             (unsigned)s_dma_cap_frames,
+             (unsigned)(s_dma_cap_frames ? s_dma_cap_frames * 1000 / s_src.info.sample_rate : 0));
 
     {
         static uint8_t pcm_in[AUDIO_RECV_CHUNK];        /* 内部 RAM: 环形缓冲取出的 PCM */
@@ -690,8 +784,7 @@ static void audio_player_task(void *pvParameters)
 
             if (s_sonic == NULL) {
                 /* 没有 sonic: 直通(理论上不会走到, 保底能出声) */
-                if (i2s_channel_write(app_audio_hw_tx_handle(), pcm_in, item_size, &bytes_written,
-                                      pdMS_TO_TICKS(1000)) != ESP_OK) {
+                if (audio_dma_write(pcm_in, item_size, &bytes_written) != ESP_OK) {
                     ESP_LOGW(TAG, "i2s_channel_write 失败");
                     break;
                 }
@@ -738,8 +831,7 @@ static void audio_player_task(void *pvParameters)
 
                 if (out_data.out_num > 0) {
                     size_t bytes = (size_t)out_data.out_num * 4;
-                    if (i2s_channel_write(app_audio_hw_tx_handle(), pcm_out, bytes, &bytes_written,
-                                          pdMS_TO_TICKS(1000)) != ESP_OK) {
+                    if (audio_dma_write(pcm_out, bytes, &bytes_written) != ESP_OK) {
                         ESP_LOGW(TAG, "i2s_channel_write 失败");
                         goto player_done;
                     }
@@ -864,7 +956,36 @@ int64_t app_audio_get_clock_us(void)
     if (!s_clock_started) {
         return 0;
     }
-    return clock_now_us();
+
+    int64_t media = clock_now_us();
+
+#if AUDIO_LATENCY_COMP_ENABLE
+    /* 送进 I2S 的音频还压在 DMA 里, 真正响出来要晚 "DMA 里的帧数 / 采样率";
+     * 换算成媒体时间还要乘倍率。把时钟往回拨同样多, 画面就和"听到的声音"对齐了。 */
+    if (s_clock_rate) {
+        int64_t lag_us = (int64_t)s_dma_fill_frames * 1000000LL / (int64_t)s_clock_rate;
+        lag_us = (int64_t)((double)lag_us * (double)s_speed);
+        media -= lag_us;
+        if (media < 0) {
+            media = 0;
+        }
+    }
+#endif
+
+    return media;
+}
+
+int32_t app_audio_get_output_lag_us(void)
+{
+#if AUDIO_LATENCY_COMP_ENABLE
+    if (!s_clock_rate) {
+        return 0;
+    }
+    int64_t lag_us = (int64_t)s_dma_fill_frames * 1000000LL / (int64_t)s_clock_rate;
+    return (int32_t)((double)lag_us * (double)s_speed);
+#else
+    return 0;
+#endif
 }
 
 bool app_audio_is_playing(void)
