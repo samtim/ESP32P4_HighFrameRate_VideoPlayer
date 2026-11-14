@@ -20,12 +20,15 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include <sys/stat.h>
+
 #include "app_lcd.h"
 #include "app_sdcard.h"
 #include "app_audio.h"
 #include "app_es8311.h"
 #include "app_display.h"
 #include "app_keys.h"
+#include "app_led.h"
 #include "app_video.h"
 
 static const char *TAG = "main";
@@ -38,8 +41,12 @@ static const char *TAG = "main";
 
 void app_main(void)
 {
-    /* 1. SD 卡 */
-    ESP_ERROR_CHECK(app_sdcard_init());
+    /* 1. SD 卡: 冷启动时卡上电慢, 偶尔会挂载超时(0x107)。
+     *    失败就断电重来, 绝不 ESP_ERROR_CHECK -> panic 重启 */
+    while (app_sdcard_init() != ESP_OK) {
+        ESP_LOGE(TAG, "SD 卡还没就绪, 1 秒后重试 (确认卡已插好)");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
     /* 2. 屏幕 */
     app_display_init(app_lcd_init());
@@ -49,17 +56,37 @@ void app_main(void)
     ESP_ERROR_CHECK(app_audio_hw_init());
     app_audio_hw_selftest_tone();
 
-    /* 4. 视频解码引擎 + 按键 */
+    /* 4. 视频解码引擎 + 按键 + 状态灯 */
     ESP_ERROR_CHECK(app_video_init());
     app_keys_start();
+    app_led_init();
 
     ESP_LOGI(TAG, "播放速度: 第 %d 档 (%d%%), GPIO%d 加速 / GPIO%d 减速",
              app_audio_get_speed_step(), (int)(app_audio_get_speed_factor() * 100.0f + 0.5f),
              APP_KEY_SPEED_UP_GPIO, APP_KEY_SPEED_DOWN_GPIO);
 
-    /* 5. 一直循环播放这一个文件 */
+    /* 5. 一直循环播放这一个文件; 视频和同名音频必须同时存在, 否则不播只等待 */
+    char audio_path[APP_AUDIO_PATH_LEN];
+
     while (1) {
-        ESP_LOGI(TAG, "===== 播放 %s =====", VIDEO_PATH);
+        /* 5.1 视频必须存在 */
+        struct stat st;
+        if (stat(VIDEO_PATH, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0) {
+            ESP_LOGE(TAG, "找不到视频文件 %s (或文件为空), 1 秒后重试", VIDEO_PATH);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* 5.2 必须能找到**同名**音频 (.wav 优先, 其次 .mp3) */
+        char base[APP_AUDIO_PATH_LEN];
+        app_audio_make_base(VIDEO_PATH, base, sizeof(base));
+        if (!app_audio_find_pair(VIDEO_PATH, audio_path, sizeof(audio_path))) {
+            ESP_LOGE(TAG, "缺少同名音频: 需要 %s.wav 或 %s.mp3, 1 秒后重试", base, base);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "===== 播放 %s + %s =====", VIDEO_PATH, audio_path);
 
         app_video_result_t r = app_video_play(VIDEO_PATH);   /* 阻塞到播完 */
 

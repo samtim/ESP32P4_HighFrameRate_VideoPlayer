@@ -21,33 +21,54 @@ static sdmmc_card_t *s_card = NULL;
 #define SD_PHY_LDO_CHAN     4           
 #define SD_PHY_LDO_VOLT_MV  3300        
 
+/* 冷启动时卡上电比较慢, 第一次挂载偶尔会超时(0x107)。
+ * 这里给足稳定时间, 并且失败就断电重来, 最多 5 次; main 里还会再循环重试,
+ * 所以 SD 卡慢一点也不至于 panic 重启。 */
+#define SD_MOUNT_ATTEMPTS   5
+#define SD_POWER_SETTLE_MS  300     /* 上电后等多久再发第一条命令 */
+#define SD_POWER_OFF_MS     100     /* 重试前断电多久 */
+
+static bool s_power_inited = false;
+
+/* GPIO45 低电平 = 给卡供电(本板实测)。重试时先拉高断电, 让卡彻底复位再上电 */
+static void sd_power_cycle(bool first)
+{
+    if (!first) {
+        gpio_set_level(SD_PWR_EN_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(SD_POWER_OFF_MS));
+    }
+    gpio_set_level(SD_PWR_EN_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(SD_POWER_SETTLE_MS));
+}
+
 esp_err_t app_sdcard_init(void) {
-    ESP_LOGI(TAG, "Enabling SD Card PHY LDO4 Power (3.3V)...");
+    if (!s_power_inited) {
+        ESP_LOGI(TAG, "Enabling SD Card PHY LDO4 Power (3.3V)...");
 
-    esp_ldo_channel_handle_t ldo4_handle = NULL;
-    esp_ldo_channel_config_t ldo4_cfg = {
-        .chan_id = SD_PHY_LDO_CHAN,
-        .voltage_mv = SD_PHY_LDO_VOLT_MV,
-    };
-    esp_ldo_acquire_channel(&ldo4_cfg, &ldo4_handle);
+        esp_ldo_channel_handle_t ldo4_handle = NULL;
+        esp_ldo_channel_config_t ldo4_cfg = {
+            .chan_id = SD_PHY_LDO_CHAN,
+            .voltage_mv = SD_PHY_LDO_VOLT_MV,
+        };
+        esp_ldo_acquire_channel(&ldo4_cfg, &ldo4_handle);
 
-    gpio_config_t pwr_conf = {
-        .pin_bit_mask = (1ULL << SD_PWR_EN_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-    };
-    gpio_config(&pwr_conf);
-    gpio_set_level(SD_PWR_EN_GPIO, 0);  
-    vTaskDelay(pdMS_TO_TICKS(50));      
+        gpio_config_t pwr_conf = {
+            .pin_bit_mask = (1ULL << SD_PWR_EN_GPIO),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        };
+        gpio_config(&pwr_conf);
+        s_power_inited = true;
+    }
 
-    ESP_LOGI(TAG, "Initializing SD Card (SDMMC Slot 0, GPIO39-44)...");
+    /* 每次尝试都重新构造 host/slot, 因为挂载失败时驱动内部已经 deinit 过了 */
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     // ESP32-P4: SD 卡用 SLOT_0(GPIO39-44); SLOT_1(GPIO49-54) 留给 ESP-Hosted 的 SDIO
     // (参考厂商 07 例程: "For ESP32-P4, only Slot 0 for SD Card is available as ESP-Hosted uses Slot 1" )
     host.slot = SDMMC_HOST_SLOT_0;
     
-    // ★ 1. 将 SD 卡传输时钟频率设置为 50MHz
+    // ★ 1. 将 SD 卡传输时钟频率设置为 40MHz
     host.max_freq_khz = 40000; 
 
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -63,21 +84,31 @@ esp_err_t app_sdcard_init(void) {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
         .max_files = 5,
-        // ★ 2. 将 FATFS 挂载分配块大小设置为 64KB
+        // ★ 2. 将 FATFS 挂载分配块大小设置为 16KB
         .allocation_unit_size = 16 * 1024 
     };
 
-    sdmmc_card_t *card;
-    esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &card);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mount SD card (0x%x)", ret);
-        return ret;
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 1; attempt <= SD_MOUNT_ATTEMPTS; attempt++) {
+        sd_power_cycle(attempt == 1);
+
+        ESP_LOGI(TAG, "初始化 SD Card (SDMMC Slot 0, GPIO39-44, 第 %d/%d 次)...",
+                 attempt, SD_MOUNT_ATTEMPTS);
+
+        sdmmc_card_t *card = NULL;
+        ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &card);
+        if (ret == ESP_OK) {
+            s_card = card;
+            sdmmc_card_print_info(stdout, card);
+            app_sdcard_cleanup_partial();
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "SD 卡挂载失败 (0x%x), 断电重试", ret);
     }
 
-    s_card = card;
-    sdmmc_card_print_info(stdout, card);
-    app_sdcard_cleanup_partial();
-    return ESP_OK;
+    ESP_LOGE(TAG, "SD 卡初始化失败 %d 次 (0x%x)", SD_MOUNT_ATTEMPTS, ret);
+    return ret;
 }
 
 /* 清理上次没下完的残留: 0 字节文件 + *.part
