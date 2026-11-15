@@ -47,6 +47,10 @@
 #define AUDIO_DAC_VOL_0DB           0xBF
 #define AUDIO_DAC_VOL_MINUS_16DB    0x9F
 
+/* 开机默认音量(百分比, 0~100): 100 = 0dB 数字满幅, 20 -> 约 -14dB (REG32=0xA3)
+ * 想改音量就改这里, 或运行时调 app_audio_hw_set_volume_percent() */
+#define AUDIO_DEFAULT_VOLUME_PCT    20
+
 /* ============================================================================
  * 接口
  * ========================================================================== */
@@ -66,8 +70,15 @@ i2s_chan_handle_t app_audio_hw_tx_handle(void);
  */
 esp_err_t app_audio_hw_set_rate(uint32_t rate);
 
-/** @brief 设置 DAC 数字音量, 见 AUDIO_DAC_VOL_xxx */
+/** @brief 设置 DAC 数字音量, 见 AUDIO_DAC_VOL_xxx (原始寄存器值) */
 void app_audio_hw_set_dac_volume(uint8_t reg_val);
+
+/**
+ * @brief  按百分比设置音量 (0~100)
+ * @note   按幅度折算: dB = 20*log10(pct/100), 所以 20% ≈ -14dB。
+ *         100% 对应 0dB 不做增益; 0% 全衰减静音。立即生效。
+ */
+void app_audio_hw_set_volume_percent(int pct);
 
 /** @brief PA 功放使能 (高有效) */
 void app_audio_hw_pa_enable(bool enable);

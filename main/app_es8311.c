@@ -21,6 +21,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include <math.h>
+
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
@@ -98,7 +100,7 @@ static void es8311_dump_regs(void)
         ES8311_REG32_DAC_VOL, ES8311_REG37_DAC_RAMP, ES8311_REG44_GPIO,
     };
     ESP_LOGI(TAG, "---- ES8311 关键寄存器回读 (期望 00=80 01=3F 02=00 05=00 06=03 09=0C "
-                  "0D=01 12=00 13=10 31=00 32=BF 37=08 44=58) ----");
+                  "0D=01 12=00 13=10 31=00 37=08 44=58; 32 是 DAC 音量, 按 AUDIO_DEFAULT_VOLUME_PCT 折算) ----");
     for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
         uint8_t val = 0;
         if (es8311_read_reg(regs[i], &val) == ESP_OK) {
@@ -107,6 +109,34 @@ static void es8311_dump_regs(void)
             ESP_LOGE(TAG, "    REG[0x%02X] = <读失败>", regs[i]);
         }
     }
+}
+
+/* ============================================================================
+ * 音量: 百分比 -> REG[0x32] (DAC 数字音量)
+ *   REG 每档 0.5dB, 0xBF = 0dB, 0x00 = -95.5dB
+ *   百分比按**幅度**折算: dB = 20*log10(pct/100)
+ *     100% ->   0.0dB -> 0xBF
+ *      20% -> -14.0dB -> 0xA3
+ *       1% -> -40.0dB -> 0x6F
+ *   100% 以上不做增益(仍为 0dB), 避免数字削波
+ * ========================================================================== */
+static uint8_t volume_pct_to_reg(int pct)
+{
+    if (pct <= 0) {
+        return 0x00;                    /* 全衰减 = 静音 */
+    }
+    if (pct >= 100) {
+        return AUDIO_DAC_VOL_0DB;       /* 0dB, 不做增益 */
+    }
+
+    /* 衰减量(dB) = -20*log10(pct/100) */
+    float db_atten = -20.0f * log10f((float)pct / 100.0f);
+    int steps = (int)(db_atten / 0.5f + 0.5f);      /* 0.5dB 一档, 四舍五入 */
+    int reg = (int)AUDIO_DAC_VOL_0DB - steps;
+    if (reg < 0) {
+        reg = 0;
+    }
+    return (uint8_t)reg;
 }
 
 /* ============================================================================
@@ -218,11 +248,13 @@ static esp_err_t es8311_init_codec(void)
     ES8311_TRY(es8311_read_reg(ES8311_REG31_DAC_MUTE, &regv));
     ES8311_TRY(es8311_write_reg(ES8311_REG31_DAC_MUTE, (uint8_t)(regv & 0x9F)));
 
-    /* DAC 数字音量 */
-    ES8311_TRY(es8311_write_reg(ES8311_REG32_DAC_VOL, AUDIO_DAC_VOL_0DB));
+    /* DAC 数字音量: 按开机默认百分比折算 (见 app_audio_hw_set_volume_percent) */
+    ES8311_TRY(es8311_write_reg(ES8311_REG32_DAC_VOL, volume_pct_to_reg(AUDIO_DEFAULT_VOLUME_PCT)));
 
     es8311_dump_regs();
     ESP_LOGI(TAG, "ES8311 初始化完成 (Slave / I2S-Philips / 16bit / MCLK=256xfs)");
+    ESP_LOGI(TAG, "DAC 音量: %d%% (REG[0x32]=0x%02X)",
+             AUDIO_DEFAULT_VOLUME_PCT, volume_pct_to_reg(AUDIO_DEFAULT_VOLUME_PCT));
     return ESP_OK;
 }
 
@@ -329,6 +361,20 @@ void app_audio_hw_set_dac_volume(uint8_t reg_val)
 {
     if (s_es8311_dev) {
         es8311_write_reg(ES8311_REG32_DAC_VOL, reg_val);
+    }
+}
+
+void app_audio_hw_set_volume_percent(int pct)
+{
+    if (pct < 0) {
+        pct = 0;
+    } else if (pct > 100) {
+        pct = 100;
+    }
+    uint8_t reg = volume_pct_to_reg(pct);
+    if (s_es8311_dev) {
+        es8311_write_reg(ES8311_REG32_DAC_VOL, reg);
+        ESP_LOGI(TAG, "DAC 音量: %d%% (REG[0x32]=0x%02X)", pct, reg);
     }
 }
 
